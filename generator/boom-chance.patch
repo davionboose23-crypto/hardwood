@@ -1,0 +1,583 @@
+diff -ruN a/boom_line.py b/boom_line.py
+--- a/boom_line.py	1970-01-01 00:00:00.000000000 +0000
++++ b/boom_line.py	2026-11-06 23:40:19.296058567 +0000
+@@ -0,0 +1,57 @@
++"""Integer boom line the app shows.
++
++The event is not changed. A boom is still a whole-number stat at least
++
++    ceil(max(1.5 * projection, projection + ADD[stat]) - 1e-9)
++
++where `projection` is the model median before the card rounds it to one decimal.
++That rounding moves the whole number by 1 often enough to contradict the formula
++(about 27% of archived 3PM rows in Oct 24-Nov 5 2026). `display_mid` returns the
++coarsest decimal of the same median that still produces the stored line, so the
++boom sentence can show a projection the formula reproduces.
++
++Probabilities are intentionally not adjusted here.
++"""
++import math
++
++MULT = 1.5
++ADD = {"PTS": 8, "REB": 4, "AST": 3, "FG3M": 2}
++
++
++def threshold(mid, stat):
++    mid = float(mid)
++    if not math.isfinite(mid):
++        raise ValueError("projection must be finite")
++    if mid < 0:
++        mid = 0.0
++    return max(MULT * mid, mid + ADD[stat])
++
++
++def need_int(mid, stat):
++    """Smallest integer stat that counts as a boom. Matches boom.need for one row."""
++    return int(math.ceil(threshold(mid, stat) - 1e-9))
++
++
++def display_mid(mid, stat):
++    """Coarsest 1-to-4 decimal rounding of `mid` that keeps need_int unchanged.
++
++    One decimal is preferred so the boom line matches the card whenever that is honest.
++    """
++    mid = float(mid)
++    if not math.isfinite(mid):
++        raise ValueError("projection must be finite")
++    target = need_int(mid, stat)
++    for d in (1, 2, 3, 4):
++        m = round(mid, d)
++        if m >= 0 and need_int(m, stat) == target:
++            return float(m)
++    # Banker's rounding at 4 decimals crossed an integer boundary. Step back by 0.0001.
++    m = round(mid, 4)
++    direction = 1.0 if need_int(m, stat) < target else -1.0
++    for k in range(1, 200):
++        cand = round(m + direction * 0.0001 * k, 4)
++        if cand < 0:
++            continue
++        if need_int(cand, stat) == target:
++            return float(cand)
++    return float(mid)
+diff -ruN a/boom.py b/boom.py
+--- a/boom.py	2026-10-24 04:22:34.914040800 +0000
++++ b/boom.py	2026-11-06 23:40:19.296058567 +0000
+@@ -13,8 +13,9 @@
+ import config as C,combos
+ from features import TARGETS
+ import newfeats as NF
++from boom_line import MULT, ADD, display_mid
+ log=C.log('boom')
+-MULT=1.5;ADD={'PTS':8,'REB':4,'AST':3,'FG3M':2};LINES={'PTS':[10,15,20,25,30],'REB':[6,8,10,12],'AST':[4,6,8,10],'FG3M':[2,3,4,5]}
++LINES={'PTS':[10,15,20,25,30],'REB':[6,8,10,12],'AST':[4,6,8,10],'FG3M':[2,3,4,5]}
+ BOOM_FILE=C.P('models','boom.joblib');BOOM_METRICS=C.P('output','boom_metrics.json')
+ CLF=dict(objective='binary',n_estimators=400,learning_rate=0.03,num_leaves=15,min_child_samples=100,subsample=0.8,subsample_freq=1,colsample_bytree=0.7,reg_lambda=5,verbose=-1,n_jobs=4)
+ RES=dict(objective='binary',n_estimators=2000,learning_rate=0.02,num_leaves=7,min_child_samples=300,subsample=0.8,subsample_freq=1,colsample_bytree=0.6,reg_lambda=20,verbose=-1,n_jobs=4)
+diff -ruN a/boom_score.py b/boom_score.py
+--- a/boom_score.py	1970-01-01 00:00:00.000000000 +0000
++++ b/boom_score.py	2026-11-06 23:40:19.296058567 +0000
+@@ -0,0 +1,263 @@
++#!/usr/bin/env python3
++"""Read-only score of archived pregame boom chances against box scores.
++
++Does not write projections, calibration, postgame markers, or historical CSVs.
++A path under projections_archive/, data/, or output/ is refused.
++
++This is the archived 2026-27 pregame record (morning projections_archive/YYYY-MM-DD.csv,
++kept only for dates that already have a postgame marker). It is not the simulated
++2025-26 holdout in output/boom_metrics.json. Pass --simulated to print that file's
++stored Brier numbers beside the live record, clearly labeled.
++
++Boom event scored here is the archived integer line (*_boom_need), which is what the
++app printed. The 0.1 card projection does not always reproduce that line; the report
++counts those rows. Players are counted only if the morning archive projected them to
++play and the box score has minutes > 0.
++
++Usage:
++  python boom_score.py --root /path/to/nba-model
++  python boom_score.py --root /path/to/nba-model --out /tmp/boom_score.json
++"""
++import argparse, json, math, os, glob
++import numpy as np
++import pandas as pd
++from boom_line import ADD, need_int
++
++STATS = ["PTS", "REB", "AST", "FG3M"]
++LAB = {"PTS": "PTS", "REB": "REB", "AST": "AST", "FG3M": "3PM"}
++U = np.array([0, .05, .15, .5, .85, .95, 1.0])
++
++
++def nkey(s):
++    import unicodedata
++    return "".join(c for c in unicodedata.normalize("NFKD", str(s)) if c.isalnum() and not unicodedata.combining(c)).lower()
++
++
++def _refuse(path, root):
++    """Refuse writes into the operational tree."""
++    ap = os.path.realpath(path)
++    root = os.path.realpath(root)
++    banned = [os.path.join(root, p) for p in ("projections_archive", "data", "output", "models")]
++    for b in banned:
++        if ap == b or ap.startswith(b + os.sep):
++            raise SystemExit(f"refusing to write inside {b}")
++    base = os.path.basename(ap)
++    if base in {"calibration.json", "calibration_log.json", "results.json", "projections.json", "boom_metrics.json"}:
++        raise SystemExit(f"refusing to overwrite {base}")
++
++
++def knots(pr):
++    pr = np.asarray(pr, float)
++    if pr.ndim == 1:
++        pr = pr.reshape(1, -1)
++    lo70, mid, hi70, lo90, hi90 = [pr[:, i] for i in range(5)]
++    v = np.column_stack([
++        np.maximum(0, 2 * lo90 - lo70), lo90, lo70, mid, hi70, hi90, hi90 + 1.5 * (hi90 - hi70)
++    ])
++    v = np.maximum.accumulate(v, axis=1)
++    return v + np.arange(7) * 1e-6
++
++
++def q_prob(pr, y):
++    """P(integer outcome >= y), same continuity correction as boom.q_prob / the app shade."""
++    v = knots(np.asarray(pr, float))
++    y = np.atleast_1d(np.asarray(y, float))
++    seg = np.clip((v < (y - 0.5)[:, None]).sum(1) - 1, 0, 5)
++    a = v[np.arange(len(y)), seg]
++    b = v[np.arange(len(y)), seg + 1]
++    w = np.clip(((y - 0.5) - a) / np.maximum(b - a, 1e-9), 0, 1)
++    u = U[seg] + w * (U[seg + 1] - U[seg])
++    yy = y - 0.5
++    F = np.where(yy <= v[:, 0], 0.0, np.where(yy >= v[:, -1], 1.0, u))
++    out = 1 - F
++    return float(out[0]) if out.size == 1 else out
++
++
++# Same floor the boom model uses (boom.py clips probabilities to [1e-4, 1-1e-4]).
++# A displayed 0.0% is the card rounding a smaller positive chance, not a hard zero.
++_PCLIP = 1e-4
++
++
++def brier(y, p):
++    y = np.asarray(y, float)
++    p = np.clip(np.asarray(p, float), _PCLIP, 1 - _PCLIP)
++    return float(np.mean((p - y) ** 2))
++
++
++def logloss(y, p):
++    y = np.asarray(y, float)
++    p = np.clip(np.asarray(p, float), _PCLIP, 1 - _PCLIP)
++    return float(-np.mean(y * np.log(p) + (1 - y) * np.log(1 - p)))
++
++
++def auc(y, p):
++    y = np.asarray(y, int)
++    p = np.asarray(p, float)
++    pos = p[y == 1]
++    neg = p[y == 0]
++    if len(pos) == 0 or len(neg) == 0:
++        return None
++    # Mann-Whitney, average ranks for ties
++    order = np.argsort(p, kind="mergesort")
++    ranks = np.empty(len(p), float)
++    i = 0
++    ps = p[order]
++    while i < len(p):
++        j = i
++        while j + 1 < len(p) and ps[j + 1] == ps[i]:
++            j += 1
++        ranks[order[i:j + 1]] = 0.5 * (i + j) + 1
++        i = j + 1
++    rpos = ranks[y == 1].sum()
++    return float((rpos - len(pos) * (len(pos) + 1) / 2) / (len(pos) * len(neg)))
++
++
++def metrics(y, p):
++    y = np.asarray(y, int)
++    p = np.asarray(p, float)
++    m = np.isfinite(p)
++    y, p = y[m], p[m]
++    if len(y) == 0:
++        return None
++    k = max(1, int(round(len(y) * 0.1)))
++    top = np.argsort(-p)[:k]
++    return dict(
++        n=int(len(y)), events=int(y.sum()), rate=round(float(y.mean()), 4),
++        mean_p=round(float(p.mean()), 4), brier=round(brier(y, p), 5),
++        logloss=round(logloss(y, p), 5), auc=None if auc(y, p) is None else round(auc(y, p), 4),
++        top10_n=int(k), top10_rate=round(float(y[top].mean()), 4),
++    )
++
++
++def load_rows(root):
++    arch = os.path.join(root, "projections_archive")
++    markers = {}
++    for f in glob.glob(os.path.join(arch, "postgame", "*.json")):
++        with open(f) as fh:
++            m = json.load(fh)
++        if isinstance(m, dict) and m.get("date"):
++            markers[m["date"]] = True
++    frames = []
++    for f in sorted(glob.glob(os.path.join(arch, "20*.csv"))):
++        d = pd.read_csv(f)
++        if "date" not in d.columns:
++            continue
++        d["date"] = d["date"].astype(str)
++        d = d[d["date"].isin(markers)]
++        if not len(d):
++            continue
++        frames.append(d)
++    if not frames:
++        return pd.DataFrame(), sorted(markers)
++    A = pd.concat(frames, ignore_index=True)
++    role = A.projected_role.astype(str)
++    A = A[~role.str.startswith(("OUT", "DNP", "DOUBTFUL", "QUESTIONABLE")) & A["PTS_proj"].notna()].copy()
++    box = pd.read_csv(os.path.join(root, "data", "P_2026-27.csv"))
++    box["date"] = pd.to_datetime(box.GAME_DATE).dt.date.astype(str)
++    box["k"] = box.PLAYER_NAME.map(nkey) + "|" + box.TEAM_ABBREVIATION + "|" + box.date
++    A["k"] = A.player.map(nkey) + "|" + A.team + "|" + A.date.astype(str)
++    A = A.drop_duplicates("k", keep="last")
++    J = A.merge(box[["k", "MIN", "PTS", "REB", "AST", "FG3M"]], on="k", how="inner")
++    J = J[J.MIN > 0].copy()
++    return J, sorted(markers)
++
++
++def score_frame(J):
++    rows = []
++    for d in J.to_dict("records"):
++        pts = float(d["PTS_proj"])
++        role = str(d.get("projected_role") or "")
++        model = d.get("model")
++        minutes = float(d["projected_min"])
++        watch = model == "main" and pts < 20 and minutes > 0
++        role_player = watch and (not role.startswith("Starter") or minutes < 28)
++        for t in STATS:
++            lab = LAB[t]
++            need = d.get(f"{lab}_boom_need")
++            pct = d.get(f"{lab}_boom_pct")
++            if need is None or pct is None or (isinstance(need, float) and math.isnan(need)) or (isinstance(pct, float) and math.isnan(pct)):
++                continue
++            proj = float(d[f"{lab}_proj"])
++            shown = [float(d[f"{lab}_{k}"]) for k in ("low70", "proj", "high70", "low90", "high90")]
++            act = float(d["FG3M"] if t == "FG3M" else d[t])
++            line = float(need)
++            line_from_card = float(need_int(proj, t))
++            rows.append(dict(
++                date=str(d["date"]), stat=t, y=int(act + 1e-9 >= line),
++                p_arch=float(pct) / 100.0, p_tail=q_prob(shown, line),
++                line_mismatch=int(abs(line - line_from_card) > 0.1),
++                watch=bool(watch), role=bool(role_player),
++                min_jump=bool(float(d["MIN"]) >= float(d["projected_min"]) * 1.3),
++            ))
++    return pd.DataFrame(rows)
++
++
++def _block(df):
++    if df is None or not len(df):
++        return None
++    return dict(archived=metrics(df.y, df.p_arch), shaded_tail=metrics(df.y, df.p_tail),
++                line_mismatch_rate=round(float(df.line_mismatch.mean()), 4),
++                line_mismatch_n=int(df.line_mismatch.sum()))
++
++
++def simulated(root):
++    f = os.path.join(root, "output", "boom_metrics.json")
++    if not os.path.exists(f):
++        return None
++    with open(f) as fh:
++        raw = json.load(fh)
++    out = {"label": "simulated_2025_26_holdout_not_archived_pregame", "splits": raw.get("splits"), "stats": {}}
++    for t, s in (raw.get("stats") or {}).items():
++        ch, bq = s.get("chosen") or {}, s.get("baseline_quantile") or {}
++        out["stats"][t] = dict(ship=s.get("ship"), variant=s.get("variant"),
++                                model_brier=ch.get("brier"), quantile_brier=bq.get("brier"),
++                                model_logloss=ch.get("logloss"), quantile_logloss=bq.get("logloss"),
++                                model_auc=ch.get("auc"), quantile_auc=bq.get("auc"))
++    return out
++
++
++def report(root, dev_end="2026-10-31"):
++    J, markers = load_rows(root)
++    R = score_frame(J) if len(J) else pd.DataFrame()
++    live = {"label": "archived_morning_pregame_vs_box_score", "postgame_markers": markers,
++            "played_rows_with_boom": int(len(R)), "note": "Morning archive only. Late pregame/ injury snapshots are not in this bundle. Dates without a postgame marker are excluded. MIN>0."}
++    if len(R):
++        R["split"] = np.where(R.date <= dev_end, "dev", "hold")
++        live["dates"] = [str(R.date.min()), str(R.date.max())]
++        live["by_stat"] = {}
++        for t in STATS:
++            x = R[R.stat == t]
++            jump = x[x.watch & x.min_jump]
++            near = x[x.watch & ~x.min_jump]
++            live["by_stat"][t] = dict(
++                all=_block(x), dev=_block(x[x.split == "dev"]), hold=_block(x[x.split == "hold"]),
++                watch=_block(x[x.watch]), watch_hold=_block(x[x.watch & (x.split == "hold")]),
++                role=_block(x[x.role]),
++                watch_minutes=dict(
++                    near_n=int(len(near)), near_rate=None if not len(near) else round(float(near.y.mean()), 4),
++                    near_mean_p=None if not len(near) else round(float(near.p_arch.mean()), 4),
++                    jump30_n=int(len(jump)), jump30_rate=None if not len(jump) else round(float(jump.y.mean()), 4),
++                    jump30_mean_p=None if not len(jump) else round(float(jump.p_arch.mean()), 4),
++                ),
++            )
++    return dict(live=live, simulated_2025_26=simulated(root), definition={t: f"actual >= ceil(max(1.5*proj, proj+{ADD[t]}) - 1e-9)" for t in STATS})
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__)
++    ap.add_argument("--root", default=os.path.dirname(os.path.abspath(__file__)))
++    ap.add_argument("--out", help="optional JSON path outside projections_archive/, data/, output/, models/")
++    ap.add_argument("--dev-end", default="2026-10-31")
++    a = ap.parse_args()
++    rep = report(a.root, a.dev_end)
++    text = json.dumps(rep, indent=1)
++    print(text)
++    if a.out:
++        _refuse(a.out, a.root)
++        with open(a.out, "w") as f:
++            f.write(text)
++            f.write("\n")
++
++
++if __name__ == "__main__":
++    main()
+diff -ruN a/build_html.py b/build_html.py
+--- a/build_html.py	2026-10-27 21:31:35.920752800 +0000
++++ b/build_html.py	2026-11-06 23:40:19.296058567 +0000
+@@ -416,7 +416,8 @@
+ const bsrc=t=>((D.boom||{}).src||{})[t]||'quantile';
+ function boomMeter(v){const f=Math.max(0,Math.min(1,v/50)),R=30,cx=38,cy=36,ang=Math.PI*(1-f),x=cx+R*Math.cos(ang),y=cy-R*Math.sin(ang),col=v>=30?'#ff7a59':v>=20?'#e4b54a':v>=10?'#8fe0b5':'#8a968f';
+  return `<svg width="76" height="48" aria-label="boom chance ${v}%"><path d="M8 36 A30 30 0 0 1 68 36" stroke="#2c3b34" stroke-width="7" fill="none"/>${f>0?`<path d="M8 36 A30 30 0 0 1 ${x.toFixed(1)} ${y.toFixed(1)}" stroke="${col}" stroke-width="7" fill="none" stroke-linecap="round"/>`:''}<text x="38" y="34" text-anchor="middle" fill="#e8f2ec" font-size="14" font-weight="700">${v.toFixed(1)}%</text><text x="38" y="46" text-anchor="middle" fill="#93a79b" font-size="8">BOOM</text></svg>`}
+-function boomLine(t,e){const j=SK.indexOf(t);if(!e.boom)return'';return `Boom = <b>${e.bthr[j]}+ ${BLAB[t]}</b> (proj ${e.proj[j*5+1].toFixed(1)}): <b>${e.boom[j].toFixed(1)}%</b>`}
++function fmtBoomMid(m){const x=+m;if(!isFinite(x))return'';for(let d=1;d<=4;d++){const s=x.toFixed(d);if(Math.abs(Number(s)-x)<1e-8)return s}return x.toFixed(4)}
++function boomLine(t,e){const j=SK.indexOf(t);if(!e.boom)return'';const mid=e.bmid&&e.bmid[j]!=null?` (line from proj ${fmtBoomMid(e.bmid[j])})`:'';return `Boom = <b>${e.bthr[j]}+ ${BLAB[t]}</b>${mid}: <b>${e.boom[j].toFixed(1)}%</b>`}
+ function fixedLines(t,pr){const L=(((D.boom||{}).metrics||{}).stats||{})[t];const ls={PTS:[10,15,20,25,30],REB:[6,8,10,12],AST:[4,6,8,10],FG3M:[2,3,4,5]}[t];
+  return ls.map(l=>{const p=pOver(pr,l-0.5);return `<span class="pill">${l}+ ${BLAB[t]} <b>${p<0.005?'<1':Math.round(100*p)}%</b></span>`}).join(' ')}
+ function boomWatch(gs){const j0=SK.indexOf(BWS);const all=[];gs.forEach(g=>['home','away'].forEach(s=>g.teams[s].players.forEach(e=>{if(e.boom&&!e.dnp&&!e.lowconf&&e.proj[1]<20)all.push({e,g,s})})));
+@@ -428,7 +429,7 @@
+   <div class="sm" style="margin-top:4px">${fixedLines(BWS,pr)}</div></div>`};
+  return `<div class="card hi"><div class="eyebrow">BREAKOUT WATCH · ${fmtDay(st.day)} · non-stars (projected under 20 PTS)</div>
+  <div class="filters">${SK.map((t,i)=>`<button class="btn ${t===BWS?'on':''}" data-bws="${t}">${S[i]}</button>`).join('')}</div>${top.map(row).join('')}
+- <div class="sm mut" style="margin-top:6px">Boom = at least max(1.5 × projection, projection + ${(D.boom||{}).add?D.boom.add[BWS]:''}) ${BLAB[BWS]}. ${bsrc(BWS)==='model'?`Probability from the boom classifier (LightGBM, isotonic-calibrated). 2025-26 holdout: Brier ${ch.brier} vs ${bq.brier} for the quantile model, log loss ${ch.logloss} vs ${bq.logloss}, top-10% hit rate ${ch.top10pct_rate!=null?(ch.top10pct_rate*100).toFixed(1)+'%':'–'} vs base rate ${ch.rate!=null?(ch.rate*100).toFixed(1)+'%':'–'}.`:`Probability implied by the projection's quantile distribution: the dedicated classifier did not beat it on the 2025-26 holdout${bq.brier?` (quantile Brier ${bq.brier} vs classifier ${ch.brier})`:''}, so it is not used for ${BLAB[BWS]}.`} ${bsrc(BWS)==='model'?'Reasons = how many percentage points of boom chance each factor group adds (LightGBM pred_contrib).':'Reasons = factual context flags (teammates out with his with/without splits, projected-minutes jump, role change, opponent positional defense, recent boom rate), not model-weighted.'} Fixed-line chances come from the projection's distribution. Meter is full at 50%. Rookies / low-history players are not ranked.</div></div>`}
++ <div class="sm mut" style="margin-top:6px">Boom = the smallest whole number at or above max(1.5 × the model projection, projection + ${(D.boom||{}).add?D.boom.add[BWS]:''}) ${BLAB[BWS]}. That projection is the unrounded median shown in the boom line. The 0.1 number elsewhere on the card can move the whole number by 1, so the percentage belongs to the printed whole number, not to the formula reapplied to the rounded card projection. ${bsrc(BWS)==='model'?`Probability from the boom classifier (LightGBM, isotonic-calibrated). Simulated 2025-26 holdout (models refit out of fold; not the archived 2026-27 pregame record): Brier ${ch.brier} vs ${bq.brier} for the quantile model, log loss ${ch.logloss} vs ${bq.logloss}, top-10% hit rate ${ch.top10pct_rate!=null?(ch.top10pct_rate*100).toFixed(1)+'%':'–'} vs base rate ${ch.rate!=null?(ch.rate*100).toFixed(1)+'%':'–'}.`:`Probability implied by the projection's quantile distribution: the dedicated classifier did not beat it on the simulated 2025-26 holdout${bq.brier?` (quantile Brier ${bq.brier} vs classifier ${ch.brier})`:''}, so it is not used for ${BLAB[BWS]}.`} ${bsrc(BWS)==='model'?'Reasons = how many percentage points of boom chance each factor group adds (LightGBM pred_contrib).':'Reasons = factual context flags (teammates out with his with/without splits, projected-minutes jump, role change, opponent positional defense, recent boom rate), not model-weighted.'} Fixed-line chances come from the projection's distribution. Meter is full at 50%. Rookies / low-history players are not ranked.</div></div>`}
+ function heatMap(gs){if(!gs.length||!D.pos_table||!D.opp_table)return'';const t=HMS,j=SK.indexOf(t),lg=D.opp_lg||{};
+  const col=rk=>{const f=(30-rk)/29;const r=Math.round(40+f*170),g=Math.round(70+(1-Math.abs(f-.5)*2)*40),b=Math.round(80-f*50);return `rgb(${r},${g},${b})`};
+  const cell=(o,pg)=>{const x=(D.pos_table[o]||{})[pg];if(!x)return'<td>–</td>';const[v,f,rk]=x[t];return `<td style="background:${col(rk)};color:#fff;text-align:center"><b>${v.toFixed(1)}</b><span class="r" style="color:#eef">${ordn(rk)}</span></td>`};
+@@ -477,7 +478,7 @@
+  <div class="scroll"><table class="sm"><tr><th>Stat</th><th>Boom rate</th><th>Brier (model / quantile / recal.)</th><th>Log loss (model / quantile)</th><th>AUC</th><th>Top-10% hit rate (lift)</th><th>Used</th></tr>
+  ${K.map(t=>{const s=b.stats[t],c=s.chosen,q=s.baseline_quantile,r=s.baseline_quantile_recalibrated;return `<tr><td><b>${S[SK.indexOf(t)]}</b></td><td>${pc(c.rate)}</td><td>${c.brier} / ${q.brier} / ${r.brier}</td><td>${c.logloss} / ${q.logloss}</td><td>${c.auc} / ${q.auc}</td><td>${pc(c.top10pct_rate)} (${c.lift_top10}×) / ${pc(q.top10pct_rate)} (${q.lift_top10}×)</td><td>${s.ship?'<b style="color:#4fbf86">Boom model</b> ('+s.variant+')':'<span class="mut">Quantile fallback</span>'}</td></tr>`}).join('')}</table></div>
+  <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:8px">${K.map(t=>`<div>${rel(t)}</div>`).join('')}</div>
+- <div class="sm mut">Boom = ${Object.entries(b.definition).map(([k,v])=>`${S[SK.indexOf(k)]}: ${v}`).join('; ')}. Model = LightGBM boom classifier (variant picked on the 2024-25 calibration split, isotonic-calibrated); it is used for a stat only if it beats the quantile-implied probability on both Brier and log loss and beats the recalibrated quantile probability on Brier. Reliability: <span style="color:#ff7a59">model</span> vs <span style="color:#8a968f">quantile</span>, bins with 50+ games; dashed = perfect calibration.</div></div>`}
++ <div class="sm mut">Boom = ${Object.entries(b.definition).map(([k,v])=>`${S[SK.indexOf(k)]}: ${v}`).join('; ')}. Counting stats are whole numbers, so the card line is the ceiling of that value, taken from the model median before it is rounded to 0.1. These Brier and log-loss figures are the simulated 2025-26 holdout, not archived 2026-27 pregame predictions. Model = LightGBM boom classifier (variant picked on the 2024-25 calibration split, isotonic-calibrated); it is used for a stat only if it beats the quantile-implied probability on both Brier and log loss and beats the recalibrated quantile probability on Brier. Reliability: <span style="color:#ff7a59">model</span> vs <span style="color:#8a968f">quantile</span>, bins with 50+ games; dashed = perfect calibration.</div></div>`}
+ function render(){document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('sel',b.dataset.v===st.view));({slate,teams,board,lab,results,trends:trendsView})[st.view]()}
+ document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{st.view=b.dataset.v;render()});
+ const setDay=i=>{st.day=days[Math.max(0,Math.min(days.length-1,i))];$('#day').value=st.day;st.game=null;if(st.view==='teams'||st.view==='lab')st.view='slate';render()};
+diff -ruN a/precompute.py b/precompute.py
+--- a/precompute.py	2026-10-29 17:22:14.050661300 +0000
++++ b/precompute.py	2026-11-06 23:40:19.296058567 +0000
+@@ -340,9 +340,10 @@
+     PR2[t]=np.column_stack([lo70,mid,hi70,lo90,hi90])
+ # ---- boom chance (boom.py): P(stat >= max(1.5 x proj, proj + k)); classifier where it beat the quantile baseline on the 2025-26 holdout,
+ # else the quantile-implied probability.  Reasons (plain words, from pred_contrib) for each player's next game.
+-BOOM={};BNEED={};BSRC={};BWHY={}
++BOOM={};BNEED={};BMID={};BSRC={};BWHY={}
+ XD['MIN_DIFF']=XD.MIN_PRED-XD.MIN_bl;_fk={v[0] for v in first.values()}
+ for t in TARGETS:
++    BMID[t]=PRB[t][:,1]
+     if BM is None:BOOM[t]=BOOMM.q_prob(PRB[t],BOOMM.need(t,PRB[t][:,1]));BSRC[t]='quantile';BNEED[t]=BOOMM.need(t,PRB[t][:,1]);continue
+     p_,ctb,XB,BSRC[t]=BOOMM.live(BM,t,XD,PRB[t]);BOOM[t]=np.asarray(p_);BNEED[t]=BOOMM.need(t,PRB[t][:,1])
+     if XB is not None:
+@@ -373,13 +374,14 @@
+                 if any(LV[t][k] for t in TARGETS):e['lv']=''.join('1' if LV[t][k] else '0' for t in TARGETS)
+                 if PR2:e['proj2']=[round(float(PR2[t][k][j]),1) for t in C.EXTRA_TARGETS for j in range(5)]
+                 e['boom']=[round(float(100*BOOM[t][k]),1) for t in TARGETS];e['bthr']=[int(BNEED[t][k]) for t in TARGETS]
++                e['bmid']=[float(BOOMM.display_mid(float(BMID[t][k]), t)) for t in TARGETS]   # decimal that reproduces bthr; card proj is rounded to 0.1 and sometimes does not
+                 if k in BWHY:e['bwhy']={t:v for t,v in BWHY[k].items() if v}
+                 if rows[k].get('_wowy'):e['wowy']=rows[k]['_wowy']
+                 if '_k0' in e:
+                     k0=e.pop('_k0');e['inj_delta']=[round(float(PR[t][k][1]-PR[t][k0][1]),2) for t in TARGETS]
+             p=players[e['id']];notes=[]
+             # scale projection to projected minutes; 0 min => DNP (no stat projection)
+-            if (e.get('min') or 0)<=0: e['proj']=[0.0]*20;e['dnp']=1;[e.pop(x,None) for x in ('proj2','cf','rel','cw','lv','cmb','dd','td','boom','bthr','bwhy')]   # DNP: no projection, no confidence
++            if (e.get('min') or 0)<=0: e['proj']=[0.0]*20;e['dnp']=1;[e.pop(x,None) for x in ('proj2','cf','rel','cw','lv','cmb','dd','td','boom','bthr','bmid','bwhy')]   # DNP: no projection, no confidence
+             if e.get('lowconf'):notes.append({'model':'Rookie model (draft pick, college/combine profile, projected minutes); low confidence','nba_totals':'Low NBA history: career per-36 x projected minutes; low confidence'}.get(e.get('rkb'),'LOW CONFIDENCE: rookie/low-history league prior'))
+             rv=ROTEV.get((e['id'],gm['date']))
+             if rv and rv[0]=='silent':notes.append(f"No 2026-27 appearance in {team}'s {rv[1]} games and not on the injury report: projected DNP");e['rotev']='silent'
+@@ -447,7 +449,7 @@
+ for t,lab in zip(TARGETS,['PTS','REB','AST','3PM']):
+     CSVDF[f'pos_matchup_{lab}']=[ (PT.get(o,{}).get(g) or {}).get(t,[None,None])[1] for o,g in zip(CSVDF.opponent,CSVDF.pos_group)]
+ for j,lab in enumerate(['PTS','REB','AST','3PM']):
+-    CSVDF[f'{lab}_boom_pct']=[e['boom'][j] if e is not None and e.get('boom') else None for e in CE];CSVDF[f'{lab}_boom_need']=[e['bthr'][j] if e is not None and e.get('bthr') else None for e in CE]
++    CSVDF[f'{lab}_boom_pct']=[e['boom'][j] if e is not None and e.get('boom') else None for e in CE];CSVDF[f'{lab}_boom_need']=[e['bthr'][j] if e is not None and e.get('bthr') else None for e in CE];CSVDF[f'{lab}_boom_mid']=[e['bmid'][j] if e is not None and e.get('bmid') else None for e in CE]
+ CSVDF['trending_up']=[ ' | '.join(u['text'] for u in up.get(str(nm2.get(a+'|'+b,{}).get('id')),[])[:2]) for a,b in zip(CSVDF.player,CSVDF.team)]
+ if PREGAME:
+     import pregame;today=str(TODAY_ET.date());oldcsv=pd.read_csv(C.CSV)
+diff -ruN a/test_boom_line.py b/test_boom_line.py
+--- a/test_boom_line.py	1970-01-01 00:00:00.000000000 +0000
++++ b/test_boom_line.py	2026-11-06 23:40:19.296058567 +0000
+@@ -0,0 +1,75 @@
++"""Boom line contract. Does not read or write historical archives."""
++import unittest
++import boom_line as L
++
++
++class LineTests(unittest.TestCase):
++    def test_constants_unchanged(self):
++        self.assertEqual(L.MULT, 1.5)
++        self.assertEqual(L.ADD, {"PTS": 8, "REB": 4, "AST": 3, "FG3M": 2})
++
++    def test_integer_boundary(self):
++        # exact integer threshold stays on that integer (ceil(n - 1e-9) == n)
++        self.assertEqual(L.need_int(11.0, "PTS"), 19)   # max(16.5, 19) = 19
++        self.assertEqual(L.need_int(16.0, "PTS"), 24)   # max(24, 24) = 24
++        self.assertEqual(L.need_int(2.0, "FG3M"), 4)    # max(3, 4) = 4
++
++    def test_card_rounding_can_move_the_line(self):
++        # These are the contradictions seen on archived cards: 0.1 rounding vs the line.
++        self.assertEqual(L.need_int(11.04, "PTS"), 20)
++        self.assertEqual(L.need_int(11.0, "PTS"), 19)
++        self.assertEqual(L.need_int(2.01, "FG3M"), 5)
++        self.assertEqual(L.need_int(2.0, "FG3M"), 4)
++        self.assertEqual(L.need_int(0.04, "AST"), 4)
++        self.assertEqual(L.need_int(0.0, "AST"), 3)
++        self.assertEqual(L.need_int(3.04, "REB"), 8)
++        self.assertEqual(L.need_int(3.0, "REB"), 7)
++
++    def test_display_mid_reproduces_the_line(self):
++        cases = [11.04, 11.0, 11.06, 2.01, 2.0, 0.04, 0.0, 3.04, 8.0, 19.96, 0.5, 24.5]
++        for stat in L.ADD:
++            for mid in cases:
++                shown = L.display_mid(mid, stat)
++                self.assertEqual(L.need_int(shown, stat), L.need_int(mid, stat), (stat, mid, shown))
++                self.assertLessEqual(abs(shown - mid), 0.05)
++
++    def test_display_mid_prefers_one_decimal_when_honest(self):
++        self.assertEqual(L.display_mid(11.0, "PTS"), 11.0)
++        self.assertEqual(L.display_mid(11.06, "PTS"), 11.1)  # 11.1 still lines at 20
++        self.assertEqual(L.display_mid(11.04, "PTS"), 11.04)  # 11.0 would say 19
++
++    def test_grid_preserves_need(self):
++        for stat in L.ADD:
++            mid = 0.0
++            while mid <= 40.0001:
++                shown = L.display_mid(mid, stat)
++                self.assertEqual(L.need_int(shown, stat), L.need_int(mid, stat))
++                self.assertGreaterEqual(shown, 0)
++                mid = round(mid + 0.01, 2)
++
++    def test_matches_vector_formula(self):
++        import numpy as np
++        for stat, add in L.ADD.items():
++            p = np.linspace(0, 40, 4001)
++            vec = np.ceil(np.maximum(1.5 * p, p + add) - 1e-9).astype(int)
++            got = np.array([L.need_int(x, stat) for x in p])
++            self.assertTrue(np.array_equal(vec, got), stat)
++
++    def test_generator_hooks(self):
++        import os
++        root = os.path.dirname(os.path.abspath(__file__))
++        def rd(name):
++            with open(os.path.join(root, name), encoding="utf-8") as fh:
++                return fh.read()
++        boom, pre, html = rd("boom.py"), rd("precompute.py"), rd("build_html.py")
++        self.assertIn("from boom_line import MULT, ADD, display_mid", boom)
++        self.assertIn("e['bmid']", pre)
++        self.assertIn("bmid", html)
++        self.assertIn("fmtBoomMid", html)
++        self.assertIn("smallest whole number", html)
++        self.assertIn("not the archived 2026-27 pregame record", html)
++        self.assertNotIn("Boom = at least max(1.5", html)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff -ruN a/test_boom_score.py b/test_boom_score.py
+--- a/test_boom_score.py	1970-01-01 00:00:00.000000000 +0000
++++ b/test_boom_score.py	2026-11-06 23:40:19.296058567 +0000
+@@ -0,0 +1,87 @@
++"""Read-only boom scorer on a synthetic slate. Does not touch real archives."""
++import json, os, tempfile, unittest
++import pandas as pd
++import boom_score as S
++
++
++def _slate(root):
++    os.makedirs(os.path.join(root, "projections_archive", "postgame"), exist_ok=True)
++    os.makedirs(os.path.join(root, "data"), exist_ok=True)
++    os.makedirs(os.path.join(root, "output"), exist_ok=True)
++    # Two players. Card proj 2.0 for 3PM would imply line 4, archived line is 5.
++    rows = []
++    for name, team, proj3, need3, pct3, act3, mins in (
++        ("Role Player", "BOS", 2.0, 5, 9.4, 4, 22),
++        ("Other Guy", "BOS", 1.5, 4, 12.0, 5, 18),
++    ):
++        rows.append(dict(
++            date="2026-10-24", game_id="1", team=team, opponent="NYK", player=name,
++            projected_role="Bench", projected_min=mins, model="main", PTS_proj=12.0,
++            PTS_low70=6, PTS_high70=18, PTS_low90=2, PTS_high90=22, PTS_conf="Med",
++            PTS_boom_pct=8.0, PTS_boom_need=20,
++            REB_proj=3, REB_low70=1, REB_high70=5, REB_low90=0, REB_high90=7, REB_conf="Low",
++            REB_boom_pct=5.0, REB_boom_need=7,
++            AST_proj=2, AST_low70=0.5, AST_high70=4, AST_low90=0, AST_high90=5, AST_conf="Low",
++            AST_boom_pct=6.0, AST_boom_need=5,
++            **{"3PM_proj": proj3, "3PM_low70": 0.5, "3PM_high70": 3.5, "3PM_low90": 0, "3PM_high90": 4.5,
++               "3PM_conf": "Med", "3PM_boom_pct": pct3, "3PM_boom_need": need3},
++        ))
++    pd.DataFrame(rows).to_csv(os.path.join(root, "projections_archive", "2026-10-24.csv"), index=False)
++    # no marker => must be excluded
++    pd.DataFrame([{**rows[0], "date": "2026-11-06", "player": "Future"}]).to_csv(
++        os.path.join(root, "projections_archive", "2026-11-06.csv"), index=False)
++    with open(os.path.join(root, "projections_archive", "postgame", "2026-10-24.json"), "w") as fh:
++        json.dump({"date": "2026-10-24", "published": True}, fh)
++    box = pd.DataFrame([
++        dict(PLAYER_NAME="Role Player", TEAM_ABBREVIATION="BOS", GAME_DATE="2026-10-24", MIN=24, PTS=10, REB=4, AST=1, FG3M=4),
++        dict(PLAYER_NAME="Other Guy", TEAM_ABBREVIATION="BOS", GAME_DATE="2026-10-24", MIN=20, PTS=15, REB=2, AST=3, FG3M=5),
++        dict(PLAYER_NAME="Sat Out", TEAM_ABBREVIATION="BOS", GAME_DATE="2026-10-24", MIN=0, PTS=0, REB=0, AST=0, FG3M=0),
++    ])
++    box.to_csv(os.path.join(root, "data", "P_2026-27.csv"), index=False)
++    with open(os.path.join(root, "output", "boom_metrics.json"), "w") as fh:
++        json.dump({"stats": {"FG3M": {"ship": False, "variant": "residual", "chosen": {"brier": 0.07115}, "baseline_quantile": {"brier": 0.0711}}}}, fh)
++
++
++class ScoreTests(unittest.TestCase):
++    def test_scores_marked_nights_only_and_flags_line_mismatch(self):
++        with tempfile.TemporaryDirectory() as root:
++            _slate(root)
++            rep = S.report(root)
++            self.assertEqual(rep["live"]["postgame_markers"], ["2026-10-24"])
++            fg = rep["live"]["by_stat"]["FG3M"]["all"]
++            self.assertEqual(fg["archived"]["n"], 2)
++            self.assertEqual(fg["line_mismatch_n"], 1)  # Role Player: card 2.0 says 4+, archive says 5
++            # Role Player actual 4 is not a boom at the archived line of 5. Other Guy 5 >= 4 is a boom.
++            self.assertEqual(fg["archived"]["events"], 1)
++            self.assertEqual(rep["simulated_2025_26"]["label"], "simulated_2025_26_holdout_not_archived_pregame")
++            self.assertEqual(rep["simulated_2025_26"]["stats"]["FG3M"]["model_brier"], 0.07115)
++            # watch population is both (PTS proj 12 < 20, main, bench)
++            self.assertEqual(rep["live"]["by_stat"]["FG3M"]["watch"]["archived"]["n"], 2)
++
++    def test_refuses_operational_writes(self):
++        with tempfile.TemporaryDirectory() as root:
++            _slate(root)
++            for rel in ("data/calibration.json", "projections_archive/2026-10-24.csv", "output/boom_metrics.json", "models/boom.joblib"):
++                with self.assertRaises(SystemExit):
++                    S._refuse(os.path.join(root, rel), root)
++
++    def test_out_flag_does_not_touch_archive(self):
++        with tempfile.TemporaryDirectory() as root:
++            _slate(root)
++            with open(os.path.join(root, "projections_archive", "2026-10-24.csv")) as fh:
++                before = fh.read()
++            with open(os.path.join(root, "projections_archive", "postgame", "2026-10-24.json")) as fh:
++                marker = fh.read()
++            out = os.path.join(root, "boom_score_report.json")
++            S._refuse(out, root)
++            rep = S.report(root)
++            with open(out, "w") as f:
++                json.dump(rep, f)
++            with open(os.path.join(root, "projections_archive", "2026-10-24.csv")) as fh:
++                self.assertEqual(fh.read(), before)
++            with open(os.path.join(root, "projections_archive", "postgame", "2026-10-24.json")) as fh:
++                self.assertEqual(fh.read(), marker)
++
++
++if __name__ == "__main__":
++    unittest.main()
