@@ -34,7 +34,9 @@ td.cH .v{color:#8fe0b5}td.cL .v{color:#c3cfc8}.legend span{margin-right:12px}.do
 .sgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:10px}.sbox{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:12px}
 .sbox h3{margin:0;display:flex;justify-content:space-between}.why{font-size:.78rem;color:var(--muted);margin:6px 0 0;padding-left:16px}.why li{margin:2px 0}
 .drv{font-size:.8rem;width:100%}.drv td{padding:3px 4px;border:0;white-space:normal}.pos{color:#8fe0b5}.neg{color:#ffb8ae}
-.tr{display:flex;gap:10px;align-items:flex-start}.tp{min-width:120px}.filters button{margin:2px}.bctl{display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;margin-top:6px}.bctl label{display:flex;flex-direction:column;gap:2px;flex:1 1 130px;min-width:0}.bctl label.bgm{flex-basis:100%}.bctl details{flex-basis:100%}.bchip{margin-top:3px;white-space:nowrap}.bctl select{width:100%;min-height:44px;font-size:16px}.bctl .btn{min-height:44px}.filters button.on{border-color:var(--gold);color:var(--gold)}
+.tr{display:flex;gap:10px;align-items:flex-start}.tp{min-width:120px}.filters button{margin:2px}.bctl{display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;margin-top:6px}.bctl label{display:flex;flex-direction:column;gap:2px;flex:1 1 130px;min-width:0}.bctl label.bgm{flex-basis:100%}.bctl details{flex-basis:100%}.bchip{margin-top:3px;white-space:nowrap}.bctl select{width:100%;min-height:44px;font-size:16px;max-width:100%}.bctl .btn{min-height:44px}.filters button.on{border-color:var(--gold);color:var(--gold)}
+.tstat{display:grid;grid-template-columns:repeat(auto-fit,minmax(104px,1fr));gap:6px;margin-top:8px}.tstat .btn{min-height:44px;margin:0;padding:0 6px}.ttypes{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.ttypes .btn{min-height:44px;margin:0;white-space:normal;text-align:center;max-width:100%}
+.trow{display:grid;grid-template-columns:44px minmax(0,1fr);gap:8px;align-items:start}.tfigs{display:flex;flex-wrap:wrap;gap:6px 14px;align-items:baseline;margin:2px 0 4px}.tnum{font-family:var(--display);font-size:1.7rem;font-weight:700;line-height:1}.tchartwrap{max-width:100%;overflow:hidden}.tchartwrap svg{max-width:100%;height:auto}.tnone{padding:8px 0}
 @media(min-width:900px){.two{grid-template-columns:1fr 1fr}}
 @media(max-width:700px){.hide-m{display:none}.tabs{overflow-x:auto;padding:6px 8px}.tab{flex:0 0 auto;min-width:84px;font-size:1rem}#modal{padding:6px}.mbox{padding:10px;border-radius:10px}
  .sgrid{grid-template-columns:repeat(auto-fit,minmax(160px,1fr))}table{font-size:12px}.tr{flex-wrap:wrap}.controls{margin-left:0;width:100%}.status{font-size:11px}
@@ -269,19 +271,208 @@ function upSection(gs){const ids=[];gs.forEach(g=>['home','away'].forEach(s=>g.t
  if(!ids.length)return'';return `<h2>▲ Trending up <span class="sm mut">(${ids.length} players on this slate · significant positive shifts · ${D.trend_basis.split(';')[0]})</span></h2><div class="feat">${ids.slice(0,6).map(([id,g,s])=>{const u=D.up[id][0],p=P[id];
   return `<div class="card" style="border-color:#4fbf86"><div class="eyebrow" style="color:#4fbf86">▲ ${u.type.toUpperCase()}</div><div style="display:flex;align-items:center">${hs(id,1)}<div><b class="plink" data-p="${id}">${p.name}</b> <span class="mut sm">${p.pos} · ${p.team} ${s==='home'?'vs':'@'} ${g[s==='home'?'away':'home']}</span></div></div><div class="sm" style="margin:6px 0">${u.text}</div>${u.ser?tchart({...u,dir:1}):''}${D.up[id].length>1?`<div class="sm mut">+${D.up[id].length-1} more: ${D.up[id].slice(1,3).map(x=>x.type).join(', ')}</div>`:''}</div>`}).join('')}</div>`}
 
-let tf='All';
-function tchart(t){if(!t.ser)return '<div style="width:300px"></div>';const v=t.ser,W=230,Hh=46,mx=Math.max(...v,1),bw=W/v.length;let o=`<svg width="${W}" height="${Hh+12}">`;
+let tf='All',tfStat='ALL',tfGame='all',tfTeam='all';
+/* Slate-scoped Trends filters. Pure functions, no DOM.
+   Embedded by build_html.py. Also runnable under node (module.exports). */
+(function (root, factory) {
+  var api = factory();
+  if (typeof module !== 'undefined' && module.exports) module.exports = api;
+  if (root) root.HWTrends = api;
+})(typeof window !== 'undefined' ? window : null, function () {
+  var FLOOR = { PTS: 0.5, REB: 0.5, AST: 0.4, FG3M: 0.2 };
+  var COUNT = ['PTS', 'REB', 'AST', 'FG3M'];
+  var ROLE = { 'Usage spike': 1, 'Usage drop': 1, 'Role change': 1, 'Team change': 1 };
+  var STAT_NAME = { PTS: 'Points', REB: 'Rebounds', AST: 'Assists', FG3M: '3-pointers' };
+  var UP = { 'Hot streak': 1, 'Role change': 1, 'Usage spike': 1, 'Change point': 1, 'Injury usage bump': 1, 'Hot from 3': 1, '3P% regression': 1 };
+
+  function gid(x) { return x == null ? '' : String(x); }
+
+  function slateIndex(games, day) {
+    var gs = (games || []).filter(function (g) { return g.date === day; });
+    var byPid = {};
+    gs.forEach(function (g) {
+      ['home', 'away'].forEach(function (side) {
+        var team = g[side];
+        var opp = g[side === 'home' ? 'away' : 'home'];
+        var players = (g.teams[side].players) || [];
+        players.forEach(function (e) {
+          byPid[e.id] = { pid: e.id, team: team, opp: opp, side: side, gid: gid(g.id), home: g.home, away: g.away, inj: e.inj_delta || null };
+        });
+      });
+    });
+    return { games: gs, byPid: byPid };
+  }
+
+  function reconcile(idx, gameId, team) {
+    gameId = gid(gameId) || 'all';
+    team = team || 'all';
+    var ids = {};
+    var teams = {};
+    idx.games.forEach(function (g) { ids[gid(g.id)] = 1; teams[g.home] = 1; teams[g.away] = 1; });
+    if (gameId !== 'all' && !ids[gameId]) gameId = 'all';
+    if (team !== 'all' && !teams[team]) team = 'all';
+    if (gameId !== 'all' && team !== 'all') {
+      var g = idx.games.filter(function (x) { return gid(x.id) === gameId; })[0];
+      if (!g || (team !== g.home && team !== g.away)) team = 'all';
+    }
+    return { gameId: gameId, team: team };
+  }
+
+  function matchupChoices(idx, team) {
+    return idx.games.filter(function (g) { return team === 'all' || g.home === team || g.away === team; });
+  }
+
+  function teamChoices(idx, gameId) {
+    if (gameId && gameId !== 'all') {
+      var g = idx.games.filter(function (x) { return gid(x.id) === gid(gameId); })[0];
+      return g ? [g.away, g.home] : [];
+    }
+    var t = [];
+    idx.games.forEach(function (g) {
+      if (t.indexOf(g.away) < 0) t.push(g.away);
+      if (t.indexOf(g.home) < 0) t.push(g.home);
+    });
+    return t;
+  }
+
+  function parseDeltas(text) {
+    var out = {};
+    var re = /\b(PTS|REB|AST|3PM)\s*([+-]?\d+(?:\.\d+)?)/g, m;
+    while ((m = re.exec(text || ''))) out[m[1] === '3PM' ? 'FG3M' : m[1]] = parseFloat(m[2]);
+    return out;
+  }
+
+  function injuryMoves(trend, loc) {
+    var d = {};
+    if (loc && loc.inj && loc.inj.length >= 4) {
+      COUNT.forEach(function (s, i) { if (loc.inj[i] != null && isFinite(+loc.inj[i])) d[s] = +loc.inj[i]; });
+    } else d = parseDeltas(trend.text);
+    return COUNT.filter(function (s) { return d[s] != null && Math.abs(d[s]) >= FLOOR[s]; }).map(function (s) { return { stat: s, value: d[s] }; });
+  }
+
+  function inScope(trend, idx, gameId, team) {
+    var loc = idx.byPid[trend.pid];
+    if (!loc) return false;
+    if (gameId !== 'all' && loc.gid !== gid(gameId)) return false;
+    if (team !== 'all' && loc.team !== team) return false;
+    if (trend.game != null && gid(trend.game) !== loc.gid) return false;
+    return true;
+  }
+
+  function isUp(trend) {
+    return trend.dir > 0 && UP[trend.type] && trend.type !== 'Matchup edge' && trend.type !== 'Positional matchup';
+  }
+
+  function matchesStat(trend, stat, loc) {
+    if (trend.type === 'Injury usage bump') return injuryMoves(trend, loc).length > 0 && (stat === 'ALL' || injuryMoves(trend, loc).some(function (m) { return m.stat === stat; }));
+    if (ROLE[trend.type]) return stat === 'ALL';
+    if (stat === 'ALL') return true;
+    return trend.stat === stat;
+  }
+
+  function figures(trend, stat, loc) {
+    if (trend.type === 'Injury usage bump') {
+      var moves = injuryMoves(trend, loc);
+      var show = stat === 'ALL' ? moves : moves.filter(function (m) { return m.stat === stat; });
+      return { kind: 'deltas', parts: show };
+    }
+    if (trend.lv) return { kind: 'level', stat: trend.stat, now: trend.lv[1], before: trend.lv[0] };
+    if (trend.pct) return { kind: 'pct', stat: trend.stat, now: trend.pct[0], before: trend.pct[1] };
+    var by = /by\s*([+-]?\d+(?:\.\d+)?)/.exec(trend.text || '');
+    if (by) return { kind: 'delta', stat: trend.stat, value: parseFloat(by[1]) };
+    var pct = /(\d+(?:\.\d+)?)%\s*(above|below)/.exec(trend.text || '');
+    if (pct) return { kind: 'rel', stat: trend.stat, value: parseFloat(pct[1]) * (pct[2] === 'below' ? -1 : 1) };
+    if (trend.z != null) return { kind: 'z', stat: trend.stat, value: trend.z };
+    return { kind: 'none', stat: trend.stat };
+  }
+
+  function detailLine(trend, stat, loc) {
+    if (trend.type !== 'Injury usage bump' || stat === 'ALL') return trend.text || '';
+    var m = injuryMoves(trend, loc).filter(function (x) { return x.stat === stat; })[0];
+    if (!m) return '';
+    var name = STAT_NAME[stat] || stat;
+    return 'Projection ' + (m.value > 0 ? '+' : '') + m.value.toFixed(1) + ' ' + name + ' with teammates out.';
+  }
+
+  function apply(D, state) {
+    state = state || {};
+    var idx = slateIndex(D.games, state.day);
+    var rec = reconcile(idx, state.gameId || 'all', state.team || 'all');
+    var stat = state.stat || 'ALL';
+    var type = state.type || 'All';
+    function locOf(t) { return idx.byPid[t.pid]; }
+    var pool = (D.trends || []).filter(function (t) {
+      return inScope(t, idx, rec.gameId, rec.team) && matchesStat(t, stat, locOf(t));
+    });
+    var counts = { All: pool.length };
+    var upPids = {};
+    pool.forEach(function (t) {
+      counts[t.type] = (counts[t.type] || 0) + 1;
+      if (isUp(t)) upPids[t.pid] = 1;
+    });
+    counts['▲ Trending Up'] = Object.keys(upPids).length;
+    if (type !== 'All' && !counts[type]) type = 'All';
+    var rows;
+    if (type === '▲ Trending Up') {
+      var best = {};
+      pool.filter(isUp).forEach(function (t) {
+        if (!best[t.pid] || t.score > best[t.pid].score) best[t.pid] = t;
+      });
+      rows = Object.keys(best).map(function (k) { return best[k]; });
+    } else if (type === 'All') rows = pool.slice();
+    else rows = pool.filter(function (t) { return t.type === type; });
+    rows.sort(function (a, b) { return b.score - a.score; });
+    rows = rows.map(function (t) {
+      var loc = locOf(t);
+      return Object.assign({}, t, { _loc: loc, _fig: figures(t, stat, loc), _detail: detailLine(t, stat, loc) });
+    });
+    return {
+      gameId: rec.gameId, team: rec.team, stat: stat, type: type, rows: rows, counts: counts,
+      matchups: matchupChoices(idx, rec.team), teams: teamChoices(idx, rec.gameId), nGames: idx.games.length
+    };
+  }
+
+  return {
+    FLOOR: FLOOR, STAT_NAME: STAT_NAME, slateIndex: slateIndex, reconcile: reconcile,
+    matchupChoices: matchupChoices, teamChoices: teamChoices, injuryMoves: injuryMoves,
+    inScope: inScope, matchesStat: matchesStat, figures: figures, detailLine: detailLine, apply: apply
+  };
+});
+
+function tchart(t){if(!t.ser)return '';const v=t.ser,W=230,Hh=46,mx=Math.max(...v,1),bw=W/v.length;let o=`<svg viewBox="0 0 ${W} ${Hh+12}" width="${W}" height="${Hh+12}">`;
  v.forEach((x,i)=>o+=`<rect x="${i*bw}" y="${Hh-x/mx*Hh}" width="${Math.max(bw-1,1)}" height="${x/mx*Hh}" fill="${t.mark!=null&&i>=t.mark?(t.dir>=0?'#4fbf86':'#d0675b'):'#2f4a3f'}"/>`);
  if(t.mark!=null){const xm=t.mark*bw;o+=`<line x1="${xm}" x2="${xm}" y1="0" y2="${Hh}" stroke="#e4b54a" stroke-dasharray="2 2"/>`;
   if(t.lv)o+=`<line x1="0" x2="${xm}" y1="${Hh-t.lv[0]/mx*Hh}" y2="${Hh-t.lv[0]/mx*Hh}" stroke="#fff" opacity=".7"/><line x1="${xm}" x2="${W}" y1="${Hh-t.lv[1]/mx*Hh}" y2="${Hh-t.lv[1]/mx*Hh}" stroke="#fff"/>`}
  o+=`<text x="0" y="${Hh+10}" fill="#93a79b" font-size="8">${t.d0}</text><text x="${W}" y="${Hh+10}" fill="#93a79b" font-size="8" text-anchor="end">${t.d1}</text></svg>`;
- const z=Math.min(Math.abs(t.z||0),10);return `<div style="display:flex;gap:8px;align-items:center">${o}<div class="sm"><div class="mut" style="font-size:.7rem">|z| ${Math.abs(t.z||0).toFixed(1)}</div><svg width="60" height="10"><rect width="60" height="10" fill="#22302a"/><rect width="${z*6}" height="10" fill="${t.dir>=0?'#4fbf86':'#d0675b'}"/><line x1="15" x2="15" y1="0" y2="10" stroke="#e8f2ec"/></svg>${t.pct?`<div class="mut" style="font-size:.7rem">${t.pct[0]}% vs ${t.pct[1]}%</div>`:''}</div></div>`}
-function trendsView(){const types=['All','▲ Trending Up',...new Set(D.trends.map(t=>t.type))],rows=tf==='▲ Trending Up'?Object.entries(D.up).map(([id,u])=>({...u[0],pid:+id,dir:1,type:u[0].type})).sort((a,b)=>b.score-a.score):D.trends.filter(t=>tf==='All'||t.type===tf);
- $('#main').innerHTML=`<div class="card hi"><div class="eyebrow">TRENDS</div><h2>What's moving</h2><div class="sm">Basis: <b>${D.trend_basis}</b>. Updates automatically when refresh.py pulls 2026-27 game logs.</div>
- <div class="sm mut">Streaks/role changes: last 10 (or 5) games vs the rest of the season, z = difference ÷ (player's own game-to-game SD/√n), shown when |z| ≥ 2.5 and the change is meaningful. Change points: best single split of scoring (Welch t ≥ 4). 3P%: binomial z vs prior-season 3P%. Matchup edges: SHAP contribution of opponent-defense features for the next game. Injury bumps: projection with vs without injured teammates' minutes. Ranked by strength × role size (≥12 MPG).</div>
- <div class="filters" style="margin-top:8px">${types.map(t=>`<button class="btn ${t===tf?'on':''}" data-tf="${t}">${t} ${t==='All'?D.trends.length:t==='▲ Trending Up'?Object.keys(D.up).length:D.trends.filter(x=>x.type===t).length}</button>`).join('')}</div></div>
- ${rows.slice(0,150).map((t,i)=>{const p=P[t.pid];return `<div class="card tr"><div class="mut" style="width:28px">${i+1}</div>${hs(t.pid)}<div style="flex:1"><div><b class="plink" data-p="${t.pid}">${p.name}</b> <span class="mut sm">${p.pos} · ${p.team}</span> <span class="pill ${t.dir>0?'High':t.dir<0?'Out':''}">${t.type}</span></div><div class="sm">${t.text}</div></div>${tchart(t)}<div class="sm mut" style="width:70px;text-align:right">strength<br><b style="color:var(--cream)">${t.score}</b></div></div>`}).join('')}`;
- document.querySelectorAll('[data-tf]').forEach(b=>b.onclick=()=>{tf=b.dataset.tf;trendsView()})}
+ const z=Math.min(Math.abs(t.z||0),10);return `<div class="tchartwrap" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">${o}<div class="sm"><div class="mut" style="font-size:.7rem">|z| ${Math.abs(t.z||0).toFixed(1)}</div><svg width="60" height="10" viewBox="0 0 60 10"><rect width="60" height="10" fill="#22302a"/><rect width="${z*6}" height="10" fill="${t.dir>=0?'#4fbf86':'#d0675b'}"/><line x1="15" x2="15" y1="0" y2="10" stroke="#e8f2ec"/></svg>${t.pct?`<div class="mut" style="font-size:.7rem">${t.pct[0]}% vs ${t.pct[1]}%</div>`:''}</div></div>`}
+function figHTML(f){if(!f||f.kind==='none')return'';const nm=s=>HWTrends.STAT_NAME[s]||s;
+ if(f.kind==='deltas')return f.parts.map(p=>`<span><span class="tnum">${p.value>0?'+':''}${p.value.toFixed(1)}</span> <span class="sm">${nm(p.stat)}</span></span>`).join('');
+ if(f.kind==='level')return `<span><span class="tnum">${(+f.now).toFixed(1)}</span> <span class="sm">vs ${(+f.before).toFixed(1)} ${nm(f.stat)}</span></span>`;
+ if(f.kind==='pct')return `<span><span class="tnum">${(+f.now).toFixed(1)}%</span> <span class="sm">vs ${(+f.before).toFixed(1)}%</span></span>`;
+ if(f.kind==='delta')return `<span><span class="tnum">${f.value>0?'+':''}${(+f.value).toFixed(2)}</span> <span class="sm">${nm(f.stat)}</span></span>`;
+ if(f.kind==='rel')return `<span><span class="tnum">${f.value>0?'+':''}${Math.round(f.value)}%</span> <span class="sm">${nm(f.stat)}</span></span>`;
+ if(f.kind==='z')return `<span><span class="tnum">${f.value>0?'+':''}${(+f.value).toFixed(1)}</span> <span class="sm">z · ${nm(f.stat)}</span></span>`;
+ return ''}
+function trendsView(){const R=HWTrends.apply(D,{day:st.day,gameId:tfGame,team:tfTeam,stat:tfStat,type:tf});
+ tfGame=R.gameId;tfTeam=R.team;tf=R.type;
+ const stats=[['ALL','All'],['PTS','Points'],['REB','Rebounds'],['AST','Assists'],['FG3M','3-pointers']];
+ const types=['All',...(R.counts['▲ Trending Up']?['▲ Trending Up']:[]),...Object.keys(R.counts).filter(k=>k!=='All'&&k!=='▲ Trending Up'&&R.counts[k])];
+ const where=tfGame!=='all'?(R.matchups.find(g=>String(g.id)===String(tfGame))||{}):null;
+ const gameLab=where&&where.away?`${where.away} @ ${where.home}`:(tfTeam!=='all'?tfTeam:'this slate');
+ const rows=R.rows.slice(0,200);
+ $('#main').innerHTML=`<div class="card hi"><div class="eyebrow">TRENDS · ${fmtDay(st.day)}</div><h2>This slate</h2>
+ <div class="sm">${R.nGames} game${R.nGames===1?'':'s'} · <b>${rows.length}</b> ${tfStat==='ALL'?'signals':HWTrends.STAT_NAME[tfStat]} ${tf==='All'?'':`· ${tf}`} · ${esc(D.trend_basis)}</div>
+ <details class="sm mut"><summary style="min-height:44px">How signals are chosen</summary>Streaks and role changes: last 10 (or 5) games vs the rest of the season, shown when |z| ≥ 2.5. Matchup edges: opponent factors on the selected game. Positional matchup: that opponent vs his position, not a separate slate. Injury bumps list each stat that actually moves (points ≥ 0.5, rebounds ≥ 0.5, assists ≥ 0.4, threes ≥ 0.2). Minutes, usage, and team changes stay under All. Ranked by strength × role (≥12 MPG). Only players on this date's games.</details>
+ <div class="tstat" role="group" aria-label="Stat">${stats.map(([k,lab])=>`<button class="btn ${tfStat===k?'on':''}" data-tstat="${k}">${lab}</button>`).join('')}</div>
+ <div class="bctl"><label>Matchup<select id="tmatch" aria-label="Matchup">${`<option value="all">All matchups</option>`+R.matchups.map(g=>`<option value="${g.id}" ${String(tfGame)===String(g.id)?'selected':''}>${g.away} @ ${g.home}</option>`).join('')}</select></label>
+ <label>Team<select id="tteam" aria-label="Team">${`<option value="all">${tfGame==='all'?'All teams':'Both teams'}</option>`+R.teams.map(t=>`<option value="${t}" ${tfTeam===t?'selected':''}>${t}</option>`).join('')}</select></label></div>
+ <div class="ttypes" role="group" aria-label="Signal type">${types.map(t=>`<button class="btn ${t===tf?'on':''}" data-tf="${esc(t)}">${t} ${R.counts[t]||0}</button>`).join('')}</div></div>
+ ${rows.length?rows.map(t=>{const p=P[t.pid],loc=t._loc;return `<div class="card trow" data-tpid="${t.pid}" data-tteam="${esc(loc.team)}" data-tgame="${esc(loc.gid)}" data-ttype="${esc(t.type)}"><div>${hs(t.pid)}</div><div style="min-width:0"><div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:baseline"><div style="min-width:0"><b class="plink" data-p="${t.pid}">${esc(p.name)}</b> <span class="mut sm">${esc(p.pos||'')} · ${esc(loc.team)} ${loc.side==='home'?'vs':'@'} ${esc(loc.opp)}</span></div><span class="pill ${t.dir>0?'High':t.dir<0?'Out':''}">${t.dir>0?'▲ ':t.dir<0?'▼ ':''}${esc(t.type)}</span></div><div class="tfigs">${figHTML(t._fig)}</div><div class="sm">${esc(t._detail)}</div>${t.ser?tchart(t):''}<div class="sm mut">strength ${t.score}</div></div></div>`}).join(''):`<div class="card tnone sm">No ${tfStat==='ALL'?'signals':HWTrends.STAT_NAME[tfStat].toLowerCase()} for ${esc(gameLab)} on this slate.</div>`}`;
+ document.querySelectorAll('[data-tstat]').forEach(b=>b.onclick=()=>{tfStat=b.dataset.tstat;trendsView()});
+ document.querySelectorAll('[data-tf]').forEach(b=>b.onclick=()=>{tf=b.dataset.tf;trendsView()});
+ const ms=$('#tmatch'),ts=$('#tteam');
+ if(ms)ms.onchange=()=>{tfGame=ms.value;trendsView()};
+ if(ts)ts.onchange=()=>{tfTeam=ts.value;trendsView()}}
 function labExtra(){const m=D.metrics,R=D.rookie_metrics||{},cm=m.combos||{},tv=(cm.test||{}).copula||{},ti=(cm.test||{}).independent||{},tu=(cm.test_unwidened||{}).copula||{},tui=(cm.test_unwidened||{}).independent||{},X=['STL','BLK'].filter(t=>m.stats[t]);let h='';
  if(X.length)h+=`<div class="card"><div class="eyebrow">STEALS & BLOCKS MODELS · 2025-26 HOLDOUT MAE</div><table><tr><th>Stat</th><th>Model</th><th>Last-10 avg</th><th>Last-10 median</th><th>Season avg</th><th>In 70% range</th></tr>${X.map(t=>{const r=m.stats[t];return `<tr><td>${t}</td><td><b>${r.model_MAE.toFixed(3)}</b></td><td>${r.baseline_L10_MAE.toFixed(3)}</td><td>${(r.baseline_L10_median_MAE??NaN).toFixed(3)}</td><td>${r.baseline_season_avg_MAE.toFixed(3)}</td><td>${Math.round(m.intervals[t].cov70_conformal*100)}%</td></tr>`}).join('')}</table><p class="note">Same LightGBM setup + own STL/BLK rolling inputs; ${cm.extra_models_kept?'kept (beat both last-10 baselines), used in the STL+BLK combo and DD/TD':'not kept'}. Small integer counts: 70% ranges over-cover (cannot hit exactly 70% with 0/1/2 outcomes).</p></div>`;
  if(cm.stats)h+=`<div class="card"><div class="eyebrow">COMBOS · JOINT SIMULATION · 2025-26 HOLDOUT</div><div class="scroll"><table><tr><th>Combo</th><th>MAE (median)</th><th>In 70%</th><th>In 90%</th><th>Ladder ECE</th><th>Raw (no widening): copula / independent 70%</th><th>90%</th></tr>${CK.map(k=>{const r=tv[k]||{};return `<tr><td>${CL[k]}</td><td>${r.MAE_median}</td><td><b>${Math.round(r.cov70*100)}%</b></td><td><b>${Math.round(r.cov90*100)}%</b></td><td>${r.ladder_ECE}</td><td>${Math.round((tu[k]||{}).cov70*100)}% / ${Math.round((tui[k]||{}).cov70*100)}%</td><td>${Math.round((tu[k]||{}).cov90*100)}% / ${Math.round((tui[k]||{}).cov90*100)}%</td></tr>`}).join('')}
